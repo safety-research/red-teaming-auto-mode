@@ -1,0 +1,6 @@
+# Nothing excluded — the parquets here ride in LFS (see the repo `.gitattributes`).
+#
+# `fp-swe-benign-4000-sessions.parquet` is derived from real SWE-chat developer transcripts and
+# carries usernames in paths: it is committed only because this repo is private. It must not be
+# pushed to a public fork or mirror. Rebuild instead:
+# journal/2026-08-15T12-51_swe-benign-4000/02_dataset — `fetch_transcripts.py` then `build.py`.

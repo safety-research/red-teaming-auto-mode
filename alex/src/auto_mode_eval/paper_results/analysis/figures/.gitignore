@@ -1,0 +1,4 @@
+# Outputs, not sources: each `NN_` directory's `render.sh` draws everything beside it from the
+# source it holds — a `.dot`, a notebook. Regenerate rather than clone.
+*.png
+*.pdf

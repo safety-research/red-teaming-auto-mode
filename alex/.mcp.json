@@ -1,0 +1,5 @@
+{
+  "mcpServers": {
+    "nb": { "command": "uv", "args": ["run", "nb", "mcp"] }
+  }
+}
