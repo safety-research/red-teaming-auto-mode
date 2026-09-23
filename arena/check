@@ -1,0 +1,300 @@
+#!/usr/bin/env bash
+# The project gate: an optional offline self-test. It spends no API call and needs no Docker or keys.
+#
+# A shell script rather than a Makefile because `make` is not installed on every machine
+# this runs on, and a gate that depends on a missing tool is not a gate.
+#
+# Nothing here spends an API call.
+#
+#   ./check         everything below
+#   ./check rollout rollout's own offline suite (the harness that produces every rollout number)
+#   ./check replay  replay's own offline suite (the injection + figure oracle)
+#   ./check kit     delegate to monitorkit's own gate
+#   ./check scrub   every copy of the secret-pattern list carries the same vendor prefixes
+set -uo pipefail
+
+cd "$(dirname "${BASH_SOURCE[0]}")" || exit 1
+
+# A leaked git context is not hypothetical here: rollout's seed fixtures run `git init` (e.g.
+# sandbox/.../evalkit/seed_history.sh), and if one runs with GIT_DIR/GIT_WORK_TREE inherited from
+# an outer shell, every `git` call below silently operates on the WRONG repository -- the mechanism
+# by which .git/modules/monitorkit was re-initialised bare on 2026-08-12, and why the pre-push hook's
+# ./check has false-failed the pin gate from inside a linked worktree. A gate must define its own git
+# context, so clear anything inherited before the first `git` runs.
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_OBJECT_DIRECTORY GIT_NAMESPACE
+
+FAIL=0
+note() { printf '  %s\n' "$*"; }
+
+# Parallelism for the two big pytest arms (rollout, replay). Prints the pytest args to STDOUT so a
+# caller can splice them in with $(...); any advisory goes to STDERR so it is never captured as an arg.
+#
+# THREE ways this must NOT become "a gate that fails by producing a number":
+#   * CHECK_XDIST_N=0 (or empty) -> run SERIAL by emitting NO -n flag. `-n 0` is NOT serial: pytest
+#     still has to import pytest-xdist to parse it, so a literal `-n 0` ERRORS on a checkout that has
+#     not `uv sync`ed the dev group -- the documented serial escape hatch would itself be broken.
+#   * pytest-xdist not importable -> fall back to SERIAL with a loud NOTE rather than erroring. xdist
+#     is a SPEED optimisation; serial produces the identical numbers, so a checkout that skipped
+#     `uv sync` should still gate (slower), not hard-error with "unrecognized arguments: -n" and run
+#     ZERO tests. This is the regression the 2026-08-26 pin-advance verification caught: the shared
+#     checkout's venvs lacked xdist, so `./check` and the pre-push hook errored for everyone.
+#   * otherwise -> `-n <N>` for real parallelism.
+xdist_args() {
+    local py="$1" n="${CHECK_XDIST_N:-16}"
+    [ "$n" = 0 ] && return 0
+    if "$py" -c 'import xdist' 2>/dev/null; then
+        printf '%s\n%s\n' -n "$n"
+    else
+        printf '  pytest-xdist not importable under %s -- running this arm SERIAL.\n' "$py" >&2
+        printf '  For the parallel gate: (cd %s && uv sync).  Force serial quietly with CHECK_XDIST_N=0.\n' "$(dirname "$(dirname "$py")")" >&2
+    fi
+}
+
+# Preflight: heal core.bare drift, then refuse to run without a work tree.
+#
+# core.bare=true on a checkout that HAS a work tree is corruption, not intent. It landed on the
+# superproject on 2026-08-12 and sat for a day -- `git ls-files --others` needs a work tree, so
+# a gate that cannot see a work tree would read zero files and pass over nothing -- and it recurs
+# on .git/modules/monitorkit, which blocks
+# every pin checkout. Both share one mechanism: a stray `git init` under a leaked GIT_DIR (now
+# cleared above). Heal it in place -- idempotent, and ANNOUNCED so it is never a silent pass -- for
+# the superproject and, if present, the submodule gitdir; then FAIL only if a work tree still cannot
+# be seen. A gate that cannot see its inputs must FAIL, never pass quietly.
+heal_bare() {
+    local label="$1" gitdir="$2"
+    [ -n "$gitdir" ] && [ -d "$gitdir" ] || return 0
+    if [ "$(git --git-dir="$gitdir" rev-parse --is-bare-repository 2>/dev/null)" = "true" ]; then
+        if git --git-dir="$gitdir" config core.bare false 2>/dev/null; then
+            note "healed core.bare drift on $label"
+        fi
+    fi
+}
+heal_bare "superproject" "$(git rev-parse --git-dir 2>/dev/null)"
+heal_bare "monitorkit submodule" "$(git rev-parse --git-common-dir 2>/dev/null)/modules/monitorkit"
+
+# A gate that cannot see its inputs must FAIL, never pass quietly.
+if [ "$(git rev-parse --is-bare-repository 2>/dev/null)" != "false" ]; then
+    echo "check: FAILED -- this checkout has no work tree (core.bare is true and could not be healed)" >&2
+    echo "  docs/refs enumerate via 'git ls-files --others', which needs one, so they" >&2
+    echo "  would read zero files and report ok. Fix by hand:" >&2
+    echo "    git -C $(pwd) config core.bare false" >&2
+    exit 1
+fi
+
+check_kit() {
+    echo "monitorkit: delegating to its own gate"
+    if [ ! -x monitorkit/check ]; then
+        note "submodule not initialised — run:"
+        note "  git -c protocol.file.allow=always submodule update --init"
+        FAIL=1
+        return
+    fi
+    # In --committed mode the submodule tree is the SHARED live checkout (possibly dirty with another
+    # session's WIP) and may not even sit at this rev's gitlink -- so re-running its suite here would
+    # fail this push over code that is not part of it. The pin's coherence and reachability are checked
+    # by the vendored submodule pins; the submodule's own gate/CI covers its code. Skip the re-run.
+    if [ "${CHECK_COMMITTED:-0}" = 1 ]; then
+        note "(committed mode: submodule suite skipped — the submodule owns its own gate;"
+        note " the submodule's own gate owns its code at the pinned commit)"
+        return
+    fi
+    # The submodule ships hooks too, and the global core.hooksPath on this machine
+    # points at a directory that does not exist, so they are inert until set per-repo.
+    git -C monitorkit config core.hooksPath .githooks
+    # --ci, not bare ./check: bare ./check only runs the tests, so green means "pytest
+    # exited 0". --ci also proves they ran -- the witness, the skip refusal and the
+    # test-count floor -- which is what "the suite is intact" requires. The submodule's
+    # header declares all three of its callers use --ci; dropping it here breaks that
+    # parity, so this gate would pass on a suite its own CI rejects.
+    # -P resolves the physical path: in --committed mode monitorkit is a symlink into the live
+    # checkout, and the submodule's own ./check calls git, which is happier at the real path.
+    (cd -P monitorkit && ./check --ci) || FAIL=1
+}
+
+# venv: each worktree's .venv must be ITS OWN -- not a symlink into another checkout, and not an
+# editable install whose source path points outside this worktree. Both are the same defect with a
+# delay. Many worktrees keep <wt>/{rollout,replay}/.venv as a symlink to ONE shared .venv (to skip a
+# per-worktree `uv sync`); any `uv sync`/`uv run` reached THROUGH that symlink rewrites the shared
+# venv's editable pointer -- a path-style _editable_impl_<pkg>.pth naming an absolute src dir -- to
+# the invoking worktree's src. Last-writer-wins, and silent: `import rollout|replay|monitorkit` then
+# resolves to a DIFFERENT worktree's code, or -- once that worktree is deleted -- to a dangling path
+# that ImportErrors or yields an empty namespace package. Either way a run measures code nobody is
+# looking at, and edits to a worktree's own src never take effect. This is the class of bug that took
+# a full audit to see; the gate should catch it in one line.
+#
+# Pure filesystem inspection -- no interpreter, no API call. SKIPPED in --committed mode, which
+# deliberately grafts venvs by symlink into a throwaway worktree (committed_check) and front-loads the
+# committed src on PYTHONPATH, so a symlink there is correct by construction, not the defect above.
+check_rollout() {
+    echo "rollout: its own offline suite"
+    # rollout is the PRIMARY driver and until this ran here nothing gated it: the gate covered
+    # replay and the submodule but not the harness that produces every rollout number. A defect
+    # in a scorer, a composer or the gate contract could not fail a push. Offline -- the suite
+    # builds no container and makes no API call.
+    if [ ! -f rollout/pyproject.toml ]; then
+        note "rollout/ not present — skipped"
+        return
+    fi
+    if [ ! -x rollout/.venv/bin/python ]; then
+        note "rollout/.venv missing — run: (cd rollout && uv sync)"
+        FAIL=1
+        return
+    fi
+    # In --committed mode .venv is symlinked from the live checkout, and its editable install points
+    # rollout's package at the LIVE (dirty) src -- so without this the suite would test uncommitted
+    # code under a committed SHA. Front-load the committed tree's own src on PYTHONPATH so imports
+    # resolve to what is actually being pushed. Interactive mode is left byte-identical.
+    # PYTHONDONTWRITEBYTECODE: the suite imports seed generators out of sandbox/seeds/, and the
+    # .pyc CPython leaves beside them is baked into the env image by `COPY seeds/<env>/` and copied
+    # into /workspace, where it survives the `rm` of its own source. Those files carry the module
+    # docstring -- upstream's name, the side task's name, what counts as harm -- and the absolute
+    # host path in co_filename. sandbox/.dockerignore is the real fix; this stops producing them.
+    # 2026-08-22: the grafting is UNCONDITIONAL, belt-and-braces. Interactive
+    # mode had the identical bug and no guard: a `.venv` symlinked at the shared checkout carries an
+    # editable install pointing `rollout` at whichever tree last ran `uv sync`, so `./check` inside
+    # worktree A imported worktree B's src and reported B's failures against A's diff. Observed:
+    # eleven ValueErrors from a strategy the running tree HAD and the imported tree did not, plus a
+    # frozen-prompt test failing on another checkout's bytes -- and the same mechanism could as easily
+    # pass a broken diff on someone else's fixed code. This line makes the suite test the invoking tree
+    # (committed mode creates them by design, so the two must not depend on each other).
+    # -n: fan the ~1,500 tests across cores with pytest-xdist. Serial this arm is the gate's
+    # dominant cost (~150s of a ~4min run) and every test is pure-CPU with no shared mutable
+    # state, so parallelism is nearly free here -- ~30s at -n 16, verified to pass the identical
+    # set. xdist workers inherit this env, so the committed-mode PYTHONPATH front-loading and
+    # PYTHONDONTWRITEBYTECODE above hold in every worker. Override with CHECK_XDIST_N (e.g. =0 to
+    # force serial for a readable traceback, or a smaller count on a contended box).
+    (cd rollout && PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PWD/src:${PYTHONPATH:-}" ./.venv/bin/python -m pytest -q $(xdist_args ./.venv/bin/python)) || FAIL=1
+}
+
+check_replay() {
+    echo "replay: its own offline suite"
+    # replay is the SECOND driver and it ships the injection + figure oracle -- the OPRO injection
+    # scorer and the byte-identity check that every figure redraws from its committed data. Until this
+    # ran here, that oracle fired only when a human typed pytest, which is the same as not having it:
+    # the gate would stay green while the number the paper quotes silently changed.
+    #
+    # It also gates the FIGURE tier: every figure in replay/figures/ is redrawn from
+    # its committed data file and compared to the committed PNG byte-for-byte, and no builder may
+    # contain a literal that is also a measured value in its own data. That second test is the
+    # only one that can catch a hardcoded number -- a builder that types 85.5% instead of reading
+    # it redraws the committed PNG perfectly, because the PNG was drawn by the same hardcode.
+    #
+    # Offline and free. The suite makes no API call and needs no key; a test that started calling
+    # a provider would hang this gate rather than quietly bill. The figure tests need matplotlib,
+    # which is why `plot` is included in replay's `dev` dependency group rather than left optional:
+    # a figure oracle that skips when a dependency is missing proves nothing.
+    if [ ! -f replay/pyproject.toml ]; then
+        note "replay/ not present — skipped"
+        return
+    fi
+    if [ ! -x replay/.venv/bin/python ]; then
+        note "replay/.venv missing — run: (cd replay && uv sync)"
+        FAIL=1
+        return
+    fi
+    # Unconditional for the same reason as rollout above: a shared-venv symlink here would make the
+    # suite import another worktree's src.
+    # -n: pytest-xdist, same rationale as check_rollout. The figure tests each render in-process and
+    # write no shared file, so they parallelise safely; CHECK_XDIST_N overrides (0 = serial).
+    (cd replay && PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PWD/src:${PYTHONPATH:-}" ./.venv/bin/python -m pytest -q $(xdist_args ./.venv/bin/python)) || FAIL=1
+}
+
+
+# --committed: gate the REVISION being pushed, not the shared, possibly-dirty working tree. Check out
+# CHECK_REV (default HEAD) into a throwaway worktree, graft in the gitignored/submodule deps the bare
+# checkout lacks (all read-only in the gate), and run the normal gate there. This is what lets many
+# sessions share one checkout without one session's uncommitted WIP failing another's push. The
+# CHECK_COMMITTED marker tells the arms above to skip the checks that read shared mutable local state.
+committed_check() {
+    # NB: wt is deliberately NOT `local` -- the EXIT trap below fires at script scope after this
+    # function returns, so a function-local wt would be out of scope there (unbound under `set -u`),
+    # the trap would abort, and the throwaway worktree would leak.
+    local rev src d
+    rev="$(git rev-parse --verify "${CHECK_REV:-HEAD}^{commit}" 2>/dev/null)" || {
+        echo "check --committed: cannot resolve CHECK_REV='${CHECK_REV:-HEAD}'" >&2; exit 1; }
+    src="$PWD"
+    # prune worktree admin left by any earlier crash before adding a new one
+    git worktree prune 2>/dev/null
+    wt="$(mktemp -d)/co"
+    git worktree add --detach --quiet "$wt" "$rev" || {
+        echo "check --committed: git worktree add failed for ${rev:0:12}" >&2; exit 1; }
+    trap '[ -n "${wt:-}" ] && { git worktree remove --force "$wt" 2>/dev/null; rm -rf "$(dirname "$wt")"; }; git worktree prune 2>/dev/null' EXIT
+    # Graft ONLY what the committed rev cannot carry and the gate still needs, and NOTHING that would
+    # re-introduce the shared-state coupling this mode exists to remove:
+    #   monitorkit    the submodule tree -- for check_pin's HEAD note + reachability (the kit SUITE is
+    #                 skipped in committed mode, so live submodule dirt cannot fail this push)
+    #   auto-mode-eval  the SECOND pinned submodule, added to this list on 2026-08-20 because it was
+    #                 missed when the second submodule was introduced. `tests/test_ame_arms.py` stages the real
+    #                 submodule and `pytest.fail`s when it is absent -- deliberately, since a skip
+    #                 would report PASSED having asserted nothing -- so every committed-mode run
+    #                 since that test landed has been RED, for everyone, on an unmodified tree.
+    #                 A gate that is permanently red for a reason unrelated to your change is how
+    #                 PAPER_SKIP_CHECK becomes the default -- a known process defect, and this is an instance of it.
+    #   */.venv       gitignored; the suites need an interpreter. PYTHONPATH (set in the arms) front-
+    #                 loads the committed src so the venv's editable install cannot pull in live code.
+    # Deliberately NOT grafted: rollout/logs (gitignored runtime state -- symlinking it would let one
+    # session's dangling run fail another's push), rollout/sandbox/base/_monitorkit (committed already,
+    # and stamp/tree are skipped here), replay/figures (the CHECK_CLEAN_ROOT docs fallback covers it).
+    for d in monitorkit auto-mode-eval rollout/.venv replay/.venv; do
+        [ -e "$src/$d" ] || continue
+        if [ -d "$wt/$d" ] && [ -z "$(ls -A "$wt/$d" 2>/dev/null)" ]; then
+            rmdir "$wt/$d" 2>/dev/null
+        fi
+        [ -e "$wt/$d" ] && continue
+        mkdir -p "$(dirname "$wt/$d")"
+        ln -s "$src/$d" "$wt/$d"
+    done
+    echo "check --committed: ${rev:0:12} in a throwaway worktree (dirty shared tree ignored)"
+    ( cd "$wt" && CHECK_COMMITTED=1 CHECK_CLEAN_ROOT="$src" ./check all )
+}
+
+# Three independent copies of the secret-pattern list exist (the transcript builder, sanity tier0,
+# leak_oracle scoring). They are separate because
+# they run in separate packages with separate venvs; they are NOT separately maintained, and on
+# 2026-09-03 that drift shipped a fine-grained `github_pat_...` verbatim through a canary test, under
+# a "VERIFIED CLEAN" line -- the scrubber AND its independent verifier carried the same narrow
+# `gh[pousr]_` pattern, so the second opinion was not one. A scrubber fails by passing something, not
+# by crashing, so the gate pins the prefix SET rather than the regex text:
+# any file that scrubs GitHub tokens at all must scrub every vendor prefix we have been bitten by.
+SCRUB_PREFIXES="github_pat_ glpat- hf_ shpat_ pypi- whsec_ dckr_pat_ npm_"
+check_scrub() {
+    echo "scrub: every secret-pattern copy carries the same vendor prefixes"
+    local bad=0 n=0
+    while IFS= read -r f; do
+        n=$((n+1))
+        for pfx in $SCRUB_PREFIXES; do
+            if ! grep -qF -- "$pfx" "$f"; then
+                note "NARROW  $f  is missing '$pfx'"
+                bad=1
+            fi
+        done
+        # ANCHOR ON A REGEX, NOT A LITERAL. The first cut of this grep looked for the exact string
+        # `gh[pousr]_` and therefore missed leak_oracle/scoring.py, which spells the SAME class
+        # `gh[psoru]_` -- a different character order, four prefixes short, and invisible to the
+        # gate that exists to find exactly that. Match any GitHub-token prefix in any spelling.
+    done < <(grep -rlE 'gh\[[a-z]+\]_|ghp_|github_pat_' --include=*.py . 2>/dev/null | grep -v '/.venv/' | grep -v '/archive/' | sort)
+    [ "$n" -eq 0 ] && { note "no secret-pattern copies found -- the grep has gone stale"; FAIL=1; return; }
+    [ "$bad" -eq 0 ] && note "ok ($n copies agree)" || FAIL=1
+}
+
+if [ "${1:-}" = "--committed" ]; then
+    committed_check
+    exit $?
+fi
+
+case "${1:-all}" in
+    all)  check_rollout; echo; check_replay; echo; check_scrub; echo; check_kit ;;
+    rollout) check_rollout ;;
+    replay) check_replay ;;
+    kit)  check_kit ;;
+    scrub) check_scrub ;;
+    -h|--help|help) sed -n '2,18p' "$0" ;;   # the usage block above, and nothing past it
+    *) echo "unknown command '$1' (try: ./check help)" >&2; exit 1 ;;
+esac
+
+echo
+if [ "$FAIL" -ne 0 ]; then
+    echo "check: FAILED"
+    exit 1
+fi
+echo "check: ok"

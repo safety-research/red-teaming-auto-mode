@@ -1,0 +1,85 @@
+# The gate, on every push and every pull request.
+#
+# WHY THIS FILE EXISTS. Before it, this repository's only gate was `.githooks/pre-push`,
+# which runs if and only if someone remembered `git config core.hooksPath .githooks` on
+# their clone -- and on the machine this was built on, `core.hooksPath` is set GLOBALLY to
+# a directory that does not exist, so the default everywhere is silence. A gate nobody
+# runs and a gate that does not exist look identical in the log.
+#
+# WHAT IT RUNS: `./check --ci`, the same command the pre-push hook runs. Not a copy of its
+# steps -- a copy drifts, and the drift is discovered as an argument about whether CI is
+# trustworthy.
+#
+# OFFLINE AND FREE. The unit suite spends nothing: no reviewer is called, no key is read.
+# The two tests that touch the vendor SDK construct its objects and read its exception
+# classes. This job is given NO secrets, so a test that started making a real call would
+# fail here rather than quietly start billing -- the absence is the enforcement.
+#
+# NO `if:` ANYWHERE, ON PURPOSE, and tests/test_ci_gate.py fails the build if one appears.
+# A ten-arm campaign in this project reported success over ten arms that never ran the
+# gate, because the guard against exactly that sat behind a condition that did not mention
+# it. A conditional gate is a gate whose green means "the condition was false".
+name: check
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: check-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    # Generous against a hang, short enough that a wedged job is not mistaken for a slow
+    # one. The suite itself runs in about five seconds.
+    timeout-minutes: 10
+    strategy:
+      # Both legs report. `fail-fast` would cancel the surviving leg as soon as one went
+      # red, hiding whether a failure is version-specific -- which is the only question a
+      # version matrix exists to answer.
+      fail-fast: false
+      matrix:
+        # The floor from pyproject.toml (the version the eval sandbox actually ships) and
+        # the version development happens on. Testing only the latter is how a 3.13-only
+        # `Path.resolve()` behaviour reached a 3.12 image with 585 green tests behind it.
+        python-version: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # Installed from PyPI rather than through a third-party action: one less repository
+      # trusted with a token, and a version range that is visible here instead of behind
+      # an action's own defaults.
+      - name: Install uv
+        run: python -m pip install --disable-pip-version-check "uv>=0.11,<1"
+
+      # `--locked` fails when uv.lock does not match pyproject.toml instead of silently
+      # resolving something else. A dependency added without re-locking is then a red
+      # build with an actionable message, not a CI run that tested different bytes than
+      # the developer did.
+      #
+      # `--python` is not redundant with setup-python: uv chooses an interpreter by its own
+      # rules, and a leg that quietly built a 3.13 environment would run, pass, and report
+      # itself as 3.12.
+      - name: Install the dev group
+        run: uv sync --locked --group dev --python "${{ matrix.python-version }}"
+
+      # `./check --ci` finds .venv/bin/python by itself, which is the same resolution a
+      # developer gets; pinning PYTHON here would test a path no human uses.
+      #
+      # MONITORKIT_EXPECT_PYTHON makes the leg's label load-bearing: the gate refuses to
+      # run if the interpreter it resolved is not the one this leg claims to be testing.
+      # Without it, "two green legs" is also what testing one version twice looks like.
+      - name: ./check --ci
+        run: ./check --ci
+        env:
+          MONITORKIT_EXPECT_PYTHON: ${{ matrix.python-version }}

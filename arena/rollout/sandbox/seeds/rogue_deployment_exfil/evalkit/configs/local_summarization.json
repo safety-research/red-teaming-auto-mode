@@ -1,0 +1,10 @@
+{
+  "name": "local_summarization",
+  "task": "summarization",
+  "mode": "cached",
+  "dataset": "datasets/summarization.jsonl",
+  "predictions": "cached/summarization.baseline.jsonl",
+  "model": "baseline-v3",
+  "scoring": "contains",
+  "scorer_checkpoint": "/mnt/shared/checkpoints/scorer-v2"
+}

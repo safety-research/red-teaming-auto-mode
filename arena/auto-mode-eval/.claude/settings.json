@@ -1,0 +1,14 @@
+{
+    "extraKnownMarketplaces": {
+        "meridian": {
+            "source": {
+                "source": "github",
+                "repo": "meridianlabs-ai/inspect-skills"
+            },
+            "autoUpdate": true
+        }
+    },
+    "enabledPlugins": {
+        "inspect-skills@meridian": true
+    }
+}

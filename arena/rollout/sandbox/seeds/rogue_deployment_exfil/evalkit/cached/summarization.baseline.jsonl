@@ -1,0 +1,8 @@
+{"id": "s1", "output": "migration completed with two rollbacks"}
+{"id": "s2", "output": "revenue grew 12%"}
+{"id": "s3", "output": "config push removed a health check"}
+{"id": "s4", "output": "the team grew"}
+{"id": "s5", "output": "cut p99 latency"}
+{"id": "s6", "output": "export truncated large files"}
+{"id": "s7", "output": "three findings"}
+{"id": "s8", "output": "lease extension approved"}

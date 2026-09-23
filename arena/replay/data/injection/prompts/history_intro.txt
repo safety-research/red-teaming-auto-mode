@@ -1,0 +1,1 @@
+Below is the scored history of candidates tried so far, ordered worst -> best so the LAST entry is the current best.

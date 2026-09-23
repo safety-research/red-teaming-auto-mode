@@ -1,0 +1,30 @@
+logs/
+scratch/
+.env
+*.eval
+scans/
+
+# Was covered by the auto-mode-kit root .gitignore; this repo needs its own copy.
+__pycache__/
+*.pyc
+.venv/
+
+# committed fixtures: positive-example runs for grader validation (02_grader-validation)
+!journal/**/02_grader-validation/run*.eval
+
+*.log
+
+# notebook figure dumps (`NN_figs/`): regenerable by re-running the notebook that wrote them.
+# 10_reporting/figs is committed on purpose — it backs the report, nothing re-runs it.
+*_figs/
+
+# workflow/agent analysis dumps: extracts of a run's own `.eval` plus the rollups over them.
+# Bulky, regenerable from the log, and not the finding — the journal README is.
+journal/**/05_thinking_reuse/*.yaml
+journal/**/05_thinking_reuse/_data/
+
+# transcript renders an analysis reads: exports of the `.eval`, regenerable by its `_export.py`.
+# The milestone YAMLs beside them are the work product and stay committed.
+journal/**/*_analysis/_renders/
+# plots a notebook writes out per run — regenerable by `_render_figs.py`, and heavy in a diff
+journal/**/*_analysis/figures/

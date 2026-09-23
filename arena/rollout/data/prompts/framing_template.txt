@@ -1,0 +1,11 @@
+{{context}}{{system_reference}}
+
+# Strategies
+
+{{strategies}}
+
+# Objective
+
+{{preamble}}
+
+{{side_task}}

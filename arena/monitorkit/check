@@ -1,0 +1,231 @@
+#!/usr/bin/env bash
+# MonitorKit's gate. `./check` runs the unit tests; `./check --ci` runs them and then
+# proves they ran.
+#
+# ONE COMMAND, THREE CALLERS. `.githooks/pre-push`, `.github/workflows/check.yml` and a
+# human all invoke `./check --ci`. A CI job that ran something subtly different from the
+# local gate is a job whose red is argued with instead of fixed.
+#
+# A shell script rather than a Makefile because `make` is not installed everywhere this
+# runs, and a gate that depends on a missing tool is not a gate.
+#
+# WHAT IS NOT HERE, ON PURPOSE. The differential harness that compares MonitorKit against
+# the implementation it replaces lives in the research monorepo, not in this repository.
+# It depends on that older kit, and that dependency is temporary by construction: it
+# exists to cross a bridge, and once crossed it is dead weight. Permanent gates -- unit
+# tests and the invariants in the spec -- live here. See monitorkit_validation/ in the
+# monorepo. CI CANNOT RUN IT, and the README says so rather than implying coverage that
+# does not exist.
+#
+# WHAT IS NOT CHECKED, AND SHOULD NOT BE ASSUMED. `ruff` is configured in pyproject.toml
+# and is NOT run here: the tree has pre-existing findings, two of which (UP042, str+Enum ->
+# StrEnum) would change behaviour the differential pins. Adding lint to the gate is a
+# separate, dated decision, and adding it non-blockingly would be worse than leaving it
+# out -- see the README.
+set -uo pipefail
+cd "$(dirname "${BASH_SOURCE[0]}")" || exit 1
+ROOT="$PWD"
+
+# A TRIPWIRE, NOT A COVERAGE TARGET. It catches a suite that stopped being collected --
+# renamed directory, wheel shadowing the checkout, a conftest that eats collection -- all
+# of which otherwise report the same green as a passing run. Lower it, in the same commit,
+# if the suite genuinely shrinks.
+MIN_TESTS="${MONITORKIT_MIN_TESTS:-500}"
+
+die() { echo "check: ERROR: $*" >&2; exit 1; }
+
+usage() {
+    # Read out of the header rather than duplicated underneath it. A hard-coded line range
+    # starts printing shell code the moment the header grows -- which it did, within the
+    # hour -- and a second copy of the prose drifts from the first.
+    local line body
+    while IFS= read -r line; do
+        case "$line" in
+            "#!"*) continue ;;
+            "#"*)  body="${line#\#}"; printf '%s\n' "${body# }" ;;
+            *)     break ;;
+        esac
+    done < "$0"
+    echo
+    echo "  ./check              the unit tests"
+    echo "  ./check --ci         the unit tests + the witnesses that they ran (the gate)"
+    echo "  ./check --commands   the invocations this script supports, one per line"
+    echo "  ./check --help"
+}
+
+# ── the interpreter ───────────────────────────────────────────────────────────────────
+# Ordered, and every candidate is named in the failure. The previous default was a single
+# absolute path into a SIBLING repository's virtualenv: correct on one machine, and on a
+# CI runner or a fresh clone it produced "python not found at /home/labuser/..." -- which
+# reads as a broken checkout rather than "run uv sync". `.venv` first makes the repository
+# self-contained; PATH last so a machine with neither still gets a specific diagnosis.
+resolve_python() {
+    # An EXPLICIT choice is never silently overridden. Falling through to the next
+    # candidate when $PYTHON does not exist would run the gate on an interpreter nobody
+    # asked for -- a CI leg pinned to 3.12 by a typo'd path would report green from 3.13,
+    # which is the whole class of failure this repository is trying to stop.
+    if [ -n "${PYTHON:-}" ]; then
+        [ -x "$PYTHON" ] || die "PYTHON=$PYTHON is not an executable interpreter.
+       Unset it to use $ROOT/.venv/bin/python, or point it somewhere real."
+        PY="$PYTHON"
+        return 0
+    fi
+    if [ -x "$ROOT/.venv/bin/python" ]; then
+        PY="$ROOT/.venv/bin/python"
+        return 0
+    fi
+    if PY="$(command -v python3 2>/dev/null)" && [ -n "$PY" ]; then
+        return 0
+    fi
+    die "no python found. Tried: \$PYTHON${PYTHON:+ ($PYTHON)}, $ROOT/.venv/bin/python, python3 on PATH.
+       Build the repository's own environment with:  uv sync --group dev
+       Or point the gate at an interpreter:          PYTHON=/path/to/python ./check"
+}
+
+# FAIL LOUD ON A MISSING DEPENDENCY, NEVER SKIP. `python -m pytest` on an interpreter
+# without pytest exits non-zero with "No module named pytest", which is technically loud
+# and reads like a bug in this script. Naming the interpreter and the fix is the whole
+# difference between a gate people repair and a gate people bypass.
+require_pytest() {
+    "$PY" -c "import pytest" 2>/dev/null || die \
+"pytest is not importable under $PY
+       Install the dev group:  uv sync --group dev
+       Or choose another:      PYTHON=/path/to/python ./check"
+}
+
+# If the caller declared which interpreter this run is FOR, prove it before running
+# anything. A version matrix is the one arrangement where the answer to "if this were
+# broken, what would I see?" is "two green legs": `uv sync` picks an interpreter by its own
+# rules, so a leg labelled 3.12 that resolved to 3.13 tests one version twice and reports
+# two. Checked before pytest so a mismatch costs a second rather than a suite.
+require_expected_python() {
+    [ -n "${MONITORKIT_EXPECT_PYTHON:-}" ] || return 0
+    local actual
+    actual="$("$PY" -c 'import sys; print("%d.%d" % sys.version_info[:2])')"
+    [ "$actual" = "$MONITORKIT_EXPECT_PYTHON" ] || die \
+"this run was declared to be Python $MONITORKIT_EXPECT_PYTHON and is Python $actual
+       ($PY). The leg is testing an interpreter other than the one it reports."
+}
+
+# A RUNAWAY IS NEVER A PLAN, AND CANNOT BE CLEANED UP AFTERWARDS. The suite this gate runs
+# contains tests that run the gate -- that is how the interpreter pin, the push hook and the
+# witness wiring are checked at all. They run a COPY of it over a one-test suite for exactly
+# this reason, and this counter is the backstop for the day one of them is pointed at the
+# real thing instead: the gate would run the suite, which would run the gate, forever.
+#
+# Measured, not reasoned: that mistake ran past two minutes with no end, and killing it from
+# outside does not work -- each level starts its own session, so killing the child's process
+# group left 207 descendants alive and still multiplying. The only place to stop a runaway
+# is before it starts.
+#
+# A counter rather than a flag, because one level of nesting is legitimate and a flag would
+# forbid it. Deliberately AFTER require_expected_python, so a test that means to observe the
+# pin still reads the pin's diagnosis rather than this one.
+MAX_DEPTH="${MONITORKIT_MAX_DEPTH:-2}"
+require_bounded_depth() {
+    local depth=$(( "${MONITORKIT_CHECK_DEPTH:-0}" + 1 ))
+    [ "$depth" -le "$MAX_DEPTH" ] || die \
+"this is check invocation number $depth inside itself (limit $MAX_DEPTH).
+       The gate is running the suite, which is running the gate. Something that used to
+       stop a test from re-entering the gate -- the interpreter pin, a stub, a bound -- is
+       gone. Fix that; do not raise MONITORKIT_MAX_DEPTH."
+    export MONITORKIT_CHECK_DEPTH="$depth"
+}
+
+# The bootstrap-era predecessor of this function printed "no tests yet" and exited 0. That
+# was honest while the directory was empty and is a silent green now that it is not: a
+# deleted or renamed tests/ would pass the gate and the push hook. It fails closed.
+require_tests() {
+    [ -d tests ] || die "no tests/ directory. A gate with nothing to run is not a gate."
+    local found
+    found="$(find tests -name 'test_*.py' -type f 2>/dev/null | wc -l)"
+    [ "$found" -gt 0 ] || die \
+"no test_*.py under tests/. A gate with nothing to run is not a gate; if the suite is
+       really empty, say so in the commit rather than by exiting 0."
+}
+
+run_pytest() {
+    # --rootdir pins pytest's rootdir to THIS checkout. Without it pytest discovers the rootdir by
+    # walking UP the filesystem for a config marker (pyproject.toml / setup.py / tox.ini). For the
+    # real run that lands here anyway, so pinning it is a no-op. It is not a no-op for the copied
+    # gate the test_ci_gate.py cases run: that copy lives under a pytest tmp_path (i.e. below /tmp),
+    # and a stray /tmp/setup.py -- ordinary scratch on a shared box -- makes the walk adopt /tmp as
+    # rootdir. pytest then enumerates that directory on startup; against a 90k-entry /tmp it cost
+    # ~12s per inner gate, ~30s of every `./check --ci`, none of it this repository's. Pinning the
+    # rootdir makes the gate hermetic against whatever happens to sit above the checkout. Measured:
+    # inner gate 11.8s -> 0.32s; the whole gate ~35s -> a few seconds.
+    env PYTHONPATH="$ROOT/src${PYTHONPATH:+:$PYTHONPATH}" "$PY" -m pytest --rootdir "$ROOT" "$@"
+}
+
+# ── the modes ─────────────────────────────────────────────────────────────────────────
+do_tests() {
+    resolve_python
+    require_pytest
+    require_expected_python
+    require_bounded_depth
+    require_tests
+    run_pytest -q tests/
+}
+
+do_ci() {
+    resolve_python
+    require_pytest
+    require_expected_python
+    require_bounded_depth
+    require_tests
+
+    echo "check: interpreter $PY  ($("$PY" -c 'import sys; print(sys.version.split()[0])'))" >&2
+
+    # A FRESH report file per run, not a fixed path. A crash before pytest writes its
+    # report would otherwise leave the PREVIOUS run's report in place, and the witness
+    # would pass this run on last run's evidence -- the exact shape of failure this gate
+    # exists to catch. mktemp gives an empty file, and an empty report is a failure.
+    local report status
+    report="$(mktemp -t monitorkit-junit-XXXXXX.xml)" || die "could not create a report file"
+    run_pytest -q tests/ --junitxml="$report"
+    status=$?
+
+    "$PY" "$ROOT/tools/ci_witness.py" \
+        --report "$report" \
+        --min-tests "$MIN_TESTS" \
+        --pytest-status "$status" \
+        --allow-skips "${MONITORKIT_ALLOW_SKIPS:-}" \
+        --label "$("$PY" -c 'import sys; print("py" + ".".join(map(str, sys.version_info[:2])))')"
+    local witnessed=$?
+
+    rm -f "$report"
+
+    # TWO INDEPENDENT REASONS TO FAIL, and the gate needs only one of them. `pytest`'s own
+    # status was reaching the caller ONLY by way of the witness's verdict: delete the line
+    # below that tests $witnessed and `./check --ci` exits 0 on a suite with two failing
+    # tests, having printed "witness: FAILED -- 2 failed" to stderr on the way past. Loud
+    # text, green status -- a harness failing by producing a number. The second line costs
+    # nothing and means no single edit can sever the verdict from the exit code.
+    [ "$witnessed" -eq 0 ] || return 1
+    [ "$status" -eq 0 ] || return 1
+    hooks_advice
+    return 0
+}
+
+# Git hooks are disabled GLOBALLY on the machine this was built on (core.hooksPath points
+# at a directory that does not exist), so a fresh clone's pre-push hook is decorative and
+# says nothing about it. One line, at the end of a passing local run, costs nothing and is
+# the only moment anyone is looking. Silent under CI, where there is no hook to install
+# and the advice would be noise on every run.
+hooks_advice() {
+    [ -z "${CI:-}" ] || return 0
+    git rev-parse --git-dir >/dev/null 2>&1 || return 0
+    local configured
+    configured="$(git config --get core.hooksPath 2>/dev/null)"
+    [ "$configured" = ".githooks" ] && return 0
+    echo "check: NOTE -- this clone's hooks are not wired (core.hooksPath='${configured:-unset}')." >&2
+    echo "       Nothing runs this gate on push until:  git config core.hooksPath .githooks" >&2
+}
+
+case "${1:---tests}" in
+    --tests)        do_tests ;;
+    --ci)           do_ci ;;
+    --commands)     printf '%s\n' --tests --ci --commands --help ;;
+    -h|--help|help) usage ;;
+    *)              die "unknown command '$1' (try: ./check --help)" ;;
+esac

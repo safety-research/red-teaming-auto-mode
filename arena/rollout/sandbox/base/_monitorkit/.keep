@@ -1,0 +1,2 @@
+# MonitorKit is staged here at build time by scripts/stage_monitorkit_for_build.py.
+# Only this .keep is committed; monitorkit/ is gitignored (staged from ../monitorkit submodule).

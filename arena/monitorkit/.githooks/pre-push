@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# Refuse a push that has not been checked.
+#
+# Git hooks are disabled GLOBALLY on this machine: core.hooksPath is set to
+# /opt/githooks, which does not exist, so anything in .git/hooks silently never runs.
+# This repository therefore ships its hooks in a tracked directory and overrides the
+# global setting per-repo. On a fresh clone that override has to be re-applied:
+#
+#     git config core.hooksPath .githooks
+#
+# The hook runs `./check --ci`: THE SAME COMMAND .github/workflows/check.yml runs, not a
+# local approximation of it. Two gates that differ produce changes that pass here and fail
+# there, and the usual repair is to stop trusting both.
+#
+# If you are reading this because a push failed, run ./check --ci locally and fix what it
+# says. To bypass deliberately — a docs-only push, a broken interpreter — use:
+#
+#     MONITORKIT_SKIP_CHECK="<reason>" git push …
+#
+# The reason is required and is echoed, because a silent bypass becomes the default.
+set -uo pipefail
+
+if [ -n "${MONITORKIT_SKIP_CHECK:-}" ]; then
+    echo "pre-push: BYPASSED — ${MONITORKIT_SKIP_CHECK}" >&2
+    exit 0
+fi
+
+cd "$(git rev-parse --show-toplevel)" || exit 1
+
+if [ ! -x ./check ]; then
+    echo "pre-push: ./check is missing or not executable; cannot verify." >&2
+    echo "          Set MONITORKIT_SKIP_CHECK='<reason>' to override deliberately." >&2
+    exit 1
+fi
+
+echo "pre-push: ./check --ci" >&2
+if ! ./check --ci; then
+    cat >&2 <<'EOF'
+
+pre-push: REFUSED — ./check --ci failed.
+
+  A failing test is a failing test. The other two ways this refuses are less obvious,
+  and both mean the gate could not see what it was told to check:
+
+    * "N test(s) skipped" — a test that did not run, reported as one that passed. The
+      usual cause is a dependency reached through pytest.importorskip and never
+      declared. Install it, delete the test, or run with
+      MONITORKIT_ALLOW_SKIPS='<reason>' — the reason is required and is echoed.
+
+    * "only N tests executed … the floor is M" — the suite stopped being collected.
+      A renamed directory or a broken conftest passes every test it can find, and it
+      can find almost none.
+
+  The differential harness (monitorkit_validation/ in the research monorepo) is NOT
+  run by this hook and not by CI: it depends on the kit MonitorKit replaces, which
+  does not live here. If you changed rendering, admission or projection, run it too.
+EOF
+    exit 1
+fi

@@ -1,0 +1,1 @@
+You are running inside Claude Code, an agentic coding tool. Below is how the key systems work. Use this knowledge to inform your approach.

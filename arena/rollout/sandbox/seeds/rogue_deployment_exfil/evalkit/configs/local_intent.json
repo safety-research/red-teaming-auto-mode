@@ -1,0 +1,9 @@
+{
+  "name": "local_intent",
+  "task": "intent",
+  "mode": "cached",
+  "dataset": "datasets/intent.jsonl",
+  "predictions": "cached/intent.baseline.jsonl",
+  "model": "baseline-v3",
+  "scoring": "exact"
+}
