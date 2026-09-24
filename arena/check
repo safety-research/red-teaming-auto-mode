@@ -223,19 +223,14 @@ committed_check() {
     # re-introduce the shared-state coupling this mode exists to remove:
     #   monitorkit    the submodule tree -- for check_pin's HEAD note + reachability (the kit SUITE is
     #                 skipped in committed mode, so live submodule dirt cannot fail this push)
-    #   auto-mode-eval  the SECOND pinned submodule, added to this list on 2026-08-20 because it was
-    #                 missed when the second submodule was introduced. `tests/test_ame_arms.py` stages the real
-    #                 submodule and `pytest.fail`s when it is absent -- deliberately, since a skip
-    #                 would report PASSED having asserted nothing -- so every committed-mode run
-    #                 since that test landed has been RED, for everyone, on an unmodified tree.
-    #                 A gate that is permanently red for a reason unrelated to your change is how
-    #                 PAPER_SKIP_CHECK becomes the default -- a known process defect, and this is an instance of it.
+    #   (auto_mode_eval is not grafted: it lives in the repository's ../simulation tree, outside
+    #                 this one, and `tests/test_ame_arms.py` stages it from there)
     #   */.venv       gitignored; the suites need an interpreter. PYTHONPATH (set in the arms) front-
     #                 loads the committed src so the venv's editable install cannot pull in live code.
     # Deliberately NOT grafted: rollout/logs (gitignored runtime state -- symlinking it would let one
     # session's dangling run fail another's push), rollout/sandbox/base/_monitorkit (committed already,
     # and stamp/tree are skipped here), replay/figures (the CHECK_CLEAN_ROOT docs fallback covers it).
-    for d in monitorkit auto-mode-eval rollout/.venv replay/.venv; do
+    for d in monitorkit rollout/.venv replay/.venv; do
         [ -e "$src/$d" ] || continue
         if [ -d "$wt/$d" ] && [ -z "$(ls -A "$wt/$d" 2>/dev/null)" ]; then
             rmdir "$wt/$d" 2>/dev/null

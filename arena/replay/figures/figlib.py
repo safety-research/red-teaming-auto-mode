@@ -51,7 +51,7 @@ SOURCE_REPO = Path(os.environ.get(
 # Override with $AME_RESULTS.
 #
 # THIS IS THE PINNED SUBMODULE as of 2026-08-30, and it did not used to be. `paper_results`
-# now ships inside `auto-mode-eval/` at the blessed pin -- it appeared at `c100040` with five of
+# now ships inside the repository's `simulation/` tree -- it appeared at `c100040` with five of
 # the seven briefs and is complete at `6ae50ae` -- so the extractor reads the same tree the rest
 # of the repo studies, and the "results ahead of the pin" caveat this default used to carry no
 # longer applies. The commit read is still written into the data file, because a reader must not
@@ -62,7 +62,7 @@ SOURCE_REPO = Path(os.environ.get(
 # /nonexistent/auto-mode-eval, which is a working checkout other sessions move around:
 #     git -C /nonexistent/auto-mode-eval worktree add --detach \
 #         /nonexistent/auto-mode-eval-results origin/main
-AME_RESULTS = Path(os.environ.get("AME_RESULTS", str(PAPER_REPO / "auto-mode-eval")))
+AME_RESULTS = Path(os.environ.get("AME_RESULTS", str(PAPER_REPO.parent / "simulation")))
 
 
 class MissingInput(RuntimeError):

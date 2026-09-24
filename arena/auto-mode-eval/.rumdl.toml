@@ -1,5 +1,0 @@
-# Markdown lint rules for this package's docs (used by the rumdl pre-commit hook).
-# MD013 (line length) is left to the human ~90-char norm — long reference URLs can't wrap.
-# MD036 is off: the bold tagline under the H1 is intentional, not a mis-used heading.
-[global]
-disable = ["MD013", "MD036"]

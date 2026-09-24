@@ -9,11 +9,12 @@ the grade. §5 lists the claims that did *not* survive checking, because an over
 the reader to distrust the rest of it, and an incomplete one is the actual failure. §5 is load
 bearing and is not padding.
 
-**Scope.** This file covers this repository's own tracked tree. `monitorkit/` and `auto-mode-eval/`
-are **vendored in-tree** (monitorkit at `ae2957d`, auto-mode-eval at `b996610`, with its `paper_results/`
-data excluded); they carry their own third-party material and their own licences must travel with them.
-monitorkit ships without a licence file and one must be added by its author; `auto-mode-eval` publishes
-no LICENSE upstream (§6) and its terms must be settled with the maintainers before external release.
+**Scope.** This file covers this tree. `monitorkit/` is **vendored in-tree** (at `ae2957d`);
+`auto-mode-eval` is not vendored here — the `ame_*` arms read it from the repository's `../simulation/`
+tree (a scrubbed copy of `b996610`). Both carry their own third-party material and their own licences
+must travel with them. monitorkit ships without a licence file and one must be added by its author;
+`auto-mode-eval` publishes no LICENSE upstream (§6) and its terms must be settled with the maintainers
+before external release.
 §6 covers additional vendored bytes.
 
 ---

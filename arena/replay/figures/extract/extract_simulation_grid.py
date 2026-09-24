@@ -49,7 +49,7 @@ import yaml
 
 NAME = "simulation_grid"
 RESULTS = figlib.AME_RESULTS / "src/auto_mode_eval/paper_results/analysis/results/cap"
-PIN_FILE = figlib.PAPER_REPO / "auto-mode-eval"
+PIN_FILE = figlib.PAPER_REPO.parent / "simulation"
 
 # brief directory -> the label the paper uses. Order is the order they are drawn in.
 BRIEFS = {
